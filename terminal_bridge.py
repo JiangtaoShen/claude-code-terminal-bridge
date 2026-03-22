@@ -1,10 +1,10 @@
 """
-Terminal Bridge - 让 Claude Code 通过文件 IPC 操控终端 (SSH 会话等)
+Terminal Bridge - Let Claude Code control terminal sessions (SSH, etc.) via file-based IPC.
 
-使用方法:
-  1. 启动: py terminal_bridge.py
-  2. 在窗口中手动操作 (如 SSH 登录)
-  3. Claude Code 通过 command.txt 发送命令, 通过 output.txt 读取屏幕
+Usage:
+  1. Start: py terminal_bridge.py
+  2. Manually operate in the window (e.g. SSH login)
+  3. Claude Code sends commands via command.txt and reads screen via output.txt
 """
 
 import os
@@ -21,10 +21,10 @@ from winpty import PTY
 import pyte
 
 
-# ─── Win32 API 辅助 ──────────────────────────────────────────────────────────
+# ─── Win32 API Helpers ───────────────────────────────────────────────────────
 
 def _get_clipboard_text():
-    """通过 Win32 API 读取剪贴板文本"""
+    """Read clipboard text via Win32 API."""
     CF_UNICODETEXT = 13
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -42,22 +42,22 @@ def _get_clipboard_text():
     finally:
         user32.CloseClipboard()
 
-# ─── 配置 ───────────────────────────────────────────────────────────────────
+# ─── Configuration ───────────────────────────────────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BRIDGE_DIR = os.path.join(os.path.expanduser("~"), ".terminal-bridge")
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 DEFAULT_HISTORY = 1000
-SCREEN_CAPTURE_INTERVAL = 0.5   # 秒
-COMMAND_POLL_INTERVAL = 0.2     # 秒
-PTY_READ_INTERVAL = 0.05        # 秒
-DISPLAY_REFRESH_INTERVAL = 0.3  # 秒 - 控制台刷新间隔
-EXEC_RESULT_FILE = "/tmp/bridge_result.txt"  # 远程服务器上的临时结果文件
-EXEC_DONE_MARKER = "__BRIDGE_DONE_8f3a__"    # 命令完成标记
+SCREEN_CAPTURE_INTERVAL = 0.5   # seconds
+COMMAND_POLL_INTERVAL = 0.2     # seconds
+PTY_READ_INTERVAL = 0.05        # seconds
+DISPLAY_REFRESH_INTERVAL = 0.3  # seconds - console refresh interval
+EXEC_RESULT_FILE = "/tmp/bridge_result.txt"  # temp file on remote server
+EXEC_DONE_MARKER = "__BRIDGE_DONE_8f3a__"    # command completion marker
 
 
-# ─── 特殊按键映射 ───────────────────────────────────────────────────────────
+# ─── Special Key Mapping ─────────────────────────────────────────────────────
 
 KEY_MAP = {
     "CTRL+C": "\x03",
@@ -98,30 +98,30 @@ class TerminalBridge:
         self.running = True
         self.lock = threading.Lock()
 
-        # 自动检测 CMD 窗口实际尺寸
+        # Auto-detect CMD window size
         win_cols, win_rows = self._detect_console_size()
-        # 如果命令行指定了尺寸, 用指定的; 否则用窗口实际尺寸
+        # Use specified size or detected window size
         self.cols = min(cols, win_cols) if cols else win_cols
-        self.rows = min(rows, win_rows - 1) if rows else (win_rows - 1)  # -1 给状态栏
+        self.rows = min(rows, win_rows - 1) if rows else (win_rows - 1)  # -1 for status bar
         self.win_cols = win_cols
         self.win_rows = win_rows
 
-        # 初始化 PTY (匹配检测到的尺寸)
+        # Initialize PTY (matching detected size)
         self.pty = PTY(self.cols, self.rows)
         self.pty.spawn(shell)
 
-        # 初始化 pyte 虚拟终端
+        # Initialize pyte virtual terminal
         self.screen = pyte.HistoryScreen(self.cols, self.rows, history=DEFAULT_HISTORY)
         self.screen.set_mode(pyte.modes.LNM)
         self.stream = pyte.ByteStream(self.screen)
 
-        # 创建空的 command.txt
+        # Create empty command.txt
         with open(self.command_path, "w", encoding="utf-8") as f:
             pass
 
     @staticmethod
     def _detect_console_size():
-        """检测 CMD 窗口实际可见尺寸"""
+        """Detect actual visible console window size."""
         try:
             size = os.get_terminal_size()
             return size.columns, size.lines
@@ -129,13 +129,13 @@ class TerminalBridge:
             return DEFAULT_COLS, DEFAULT_ROWS
 
     def start(self):
-        """启动所有后台线程, 主线程处理用户键盘输入"""
-        # 启动诊断
-        print(f"[Bridge] 检测到窗口: {self.win_cols}x{self.win_rows}, PTY: {self.cols}x{self.rows}")
-        print(f"[Bridge] 3秒后启动...")
+        """Start all background threads; main thread handles keyboard input."""
+        # Startup diagnostics
+        print(f"[Bridge] Window: {self.win_cols}x{self.win_rows}, PTY: {self.cols}x{self.rows}")
+        print(f"[Bridge] Starting in 3 seconds...")
         time.sleep(3)
 
-        # 启用 Windows 控制台虚拟终端序列
+        # Enable Windows console virtual terminal sequences
         if sys.platform == "win32":
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetStdHandle(-11)
@@ -154,11 +154,11 @@ class TerminalBridge:
 
         self._write_status()
 
-        # 主线程: 读取用户键盘输入并转发到 PTY
+        # Main thread: read keyboard input and forward to PTY
         self._keyboard_input_loop()
 
     def _enable_quick_edit(self):
-        """启用 QuickEdit 模式, 让右键粘贴生效"""
+        """Enable QuickEdit mode for right-click paste support."""
         kernel32 = ctypes.windll.kernel32
         h_stdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         mode = ctypes.c_ulong()
@@ -167,27 +167,27 @@ class TerminalBridge:
         kernel32.SetConsoleMode(h_stdin, mode.value | 0x0040 | 0x0080)
 
     def _keyboard_input_loop(self):
-        """主线程: 读取用户键盘输入, 转发到 PTY"""
+        """Main thread: read keyboard input and forward to PTY."""
         self._enable_quick_edit()
         try:
             while self.running and self.pty.isalive():
                 if msvcrt.kbhit():
                     ch = msvcrt.getwch()
                     if ch in ("\x00", "\xe0"):
-                        # 功能键/方向键前缀, 读取第二个字节
+                        # Function/arrow key prefix, read second byte
                         ch2 = msvcrt.getwch()
                         key = self._translate_windows_key(ch2)
                         if key:
                             self.pty.write(key)
                     elif ch == "\x16":
-                        # Ctrl+V: 粘贴剪贴板内容
+                        # Ctrl+V: paste clipboard content
                         text = _get_clipboard_text()
                         if text:
-                            # 将 \r\n 和 \n 统一替换为 \r
+                            # Normalize line endings to \r
                             text = text.replace("\r\n", "\r").replace("\n", "\r")
                             self.pty.write(text)
                     else:
-                        # 普通字符, 直接发送 (回车转为 \r)
+                        # Regular character, send directly (Enter becomes \r)
                         if ch == "\r":
                             self.pty.write("\r")
                         else:
@@ -200,11 +200,11 @@ class TerminalBridge:
             self.running = False
             self._write_status()
             self._clear_console()
-            sys.stdout.write("[Bridge] 已退出\n")
+            sys.stdout.write("[Bridge] Exited\n")
             sys.stdout.flush()
 
     def _translate_windows_key(self, ch2):
-        """将 Windows 功能键码转为 ANSI 转义序列"""
+        """Translate Windows function key codes to ANSI escape sequences."""
         mapping = {
             "H": "\x1b[A",   # Up
             "P": "\x1b[B",   # Down
@@ -219,7 +219,7 @@ class TerminalBridge:
         return mapping.get(ch2)
 
     def _pty_reader_loop(self):
-        """后台线程: 持续读取 PTY 输出, 喂给 pyte (不直接输出到控制台)"""
+        """Background thread: read PTY output and feed to pyte (no direct console output)."""
         while self.running and self.pty.isalive():
             try:
                 data = self.pty.read(blocking=False)
@@ -233,29 +233,29 @@ class TerminalBridge:
         self.running = False
 
     def _get_stdout_handle(self):
-        """获取 stdout 句柄 (缓存)"""
+        """Get stdout handle (cached)."""
         if not hasattr(self, "_h_stdout"):
             self._h_stdout = ctypes.windll.kernel32.GetStdHandle(-11)
         return self._h_stdout
 
     def _set_cursor_pos(self, x, y):
-        """使用 Win32 API 直接设置控制台光标位置"""
+        """Set console cursor position via Win32 API."""
         handle = self._get_stdout_handle()
         coord = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
         ctypes.windll.kernel32.SetConsoleCursorPosition(handle, coord)
 
     def _set_console_buffer_size(self, cols, rows):
-        """设置控制台缓冲区大小, 使其刚好等于窗口大小, 消除滚动条"""
+        """Set console buffer size to match window size, eliminating scrollbar."""
         handle = self._get_stdout_handle()
         coord = (cols & 0xFFFF) | ((rows & 0xFFFF) << 16)
         ctypes.windll.kernel32.SetConsoleScreenBufferSize(handle, coord)
 
     def _clear_console(self):
-        """清屏"""
+        """Clear the console screen."""
         os.system("cls")
 
     def _display_refresh_loop(self):
-        """后台线程: 用 _set_cursor_pos 回到原点, ANSI \\x1b[K 清行尾, 避免滚屏"""
+        """Background thread: overwrite display in-place using cursor repositioning and ANSI clear-to-EOL."""
         last_snapshot = ""
         self._clear_console()
 
@@ -274,28 +274,28 @@ class TerminalBridge:
                     now = datetime.now().strftime("%H:%M:%S")
                     status = f" BRIDGE | {self.cols}x{self.rows} | ({cursor_y},{cursor_x}) | {now} "
 
-                    # 回到 (0,0)
+                    # Move cursor to (0,0)
                     self._set_cursor_pos(0, 0)
 
                     buf = []
-                    # 状态栏 (反色 + 清除行尾)
+                    # Status bar (reverse video + clear to end of line)
                     buf.append(f"\x1b[7m{status}\x1b[0m\x1b[K")
 
-                    # PTY 行: 只输出 rows 行, 每行末尾 \x1b[K 清除残留
+                    # PTY lines: output exactly 'rows' lines, clear trailing chars with \x1b[K
                     for i in range(self.rows):
                         line = lines[i] if i < len(lines) else ""
                         text = line.rstrip()
                         if i == cursor_y:
-                            # 光标位置反色标记
-                            padded = line  # 保留空格以正确定位光标
+                            # Highlight cursor position with reverse video
+                            padded = line  # preserve spaces for correct cursor positioning
                             chars = list(padded)
                             if cursor_x < len(chars):
                                 chars[cursor_x] = "\x1b[7m" + chars[cursor_x] + "\x1b[0m"
                             text = "".join(chars).rstrip()
                         buf.append(text + "\x1b[K")
 
-                    # 用 \n 连接, 但最后不加 \n (防止滚屏)
-                    # 再加 \x1b[J 清除下方所有残留
+                    # Join with \n but no trailing \n (prevents scrolling)
+                    # Append \x1b[J to clear everything below
                     sys.stdout.write("\n".join(buf) + "\x1b[J")
                     sys.stdout.flush()
             except Exception:
@@ -303,7 +303,7 @@ class TerminalBridge:
             time.sleep(DISPLAY_REFRESH_INTERVAL)
 
     def _screen_capture_loop(self):
-        """后台线程: 定期将 pyte 屏幕内容写入 output.txt"""
+        """Background thread: periodically write pyte screen content to output.txt."""
         while self.running:
             try:
                 self._render_output()
@@ -311,21 +311,21 @@ class TerminalBridge:
                 pass
             time.sleep(SCREEN_CAPTURE_INTERVAL)
 
-        # 最终写入一次
+        # Final write on exit
         try:
             self._render_output()
         except Exception:
             pass
 
     def _render_output(self):
-        """将 pyte 当前可见屏幕写入 output.txt (不含滚动历史)"""
+        """Write current pyte visible screen to output.txt (no scroll history)."""
         now = datetime.now().isoformat(timespec="seconds")
         alive = self.pty.isalive()
 
         with self.lock:
             display_lines = [row.rstrip() for row in self.screen.display]
 
-        # 只保留当前屏幕 (历史已在 Claude Code 上下文中)
+        # Only keep current screen (history is already in Claude Code context)
         parts = [f"[alive: {str(alive).lower()}] [timestamp: {now}]"]
         parts.extend(display_lines)
 
@@ -340,7 +340,7 @@ class TerminalBridge:
         self._write_status()
 
     def _command_watcher_loop(self):
-        """后台线程: 监听 command.txt, 读取命令并发送到 PTY"""
+        """Background thread: watch command.txt and send commands to PTY."""
         while self.running and self.pty.isalive():
             try:
                 if os.path.exists(self.command_path):
@@ -348,7 +348,7 @@ class TerminalBridge:
                         content = f.read()
                     if content.strip():
                         self._process_command(content)
-                        # 清空 command.txt
+                        # Clear command.txt
                         with open(self.command_path, "w", encoding="utf-8") as f:
                             pass
                         self.last_command_processed = datetime.now().isoformat(timespec="seconds")
@@ -358,13 +358,13 @@ class TerminalBridge:
             time.sleep(COMMAND_POLL_INTERVAL)
 
     def _process_command(self, content):
-        """解析并执行命令
+        """Parse and execute commands.
 
-        支持的前缀:
-          (无前缀)  - 普通命令, 发送文本 + 回车
-          EXEC:     - 执行命令并将完整输出保存到 result.txt (无行数限制)
-          RAW:      - 发送原始字节 (支持 \\x03 等转义)
-          KEY:      - 发送特殊按键 (ENTER, CTRL+C, UP 等)
+        Supported prefixes:
+          (none)    - Plain command, send text + Enter
+          EXEC:     - Execute and capture full output to result.txt (no line limit)
+          RAW:      - Send raw bytes (supports \\x03 etc.)
+          KEY:      - Send special key (ENTER, CTRL+C, UP, etc.)
         """
         for line in content.splitlines():
             line = line.strip()
@@ -372,11 +372,11 @@ class TerminalBridge:
                 continue
 
             if line.startswith("EXEC:"):
-                # 完整输出捕获: 重定向到文件, 完成后写标记
+                # Full output capture: redirect to file, write done marker
                 cmd = line[5:].strip()
                 wrapped = f"{cmd} > {EXEC_RESULT_FILE} 2>&1; echo {EXEC_DONE_MARKER}"
                 self.pty.write(wrapped + "\r")
-                # 启动后台线程等待完成并写入 result.txt
+                # Start background thread to wait for completion and write result.txt
                 threading.Thread(
                     target=self._wait_exec_result,
                     args=(cmd,),
@@ -391,15 +391,15 @@ class TerminalBridge:
                 if key_name in KEY_MAP:
                     self.pty.write(KEY_MAP[key_name])
             else:
-                # 普通命令, 发送文本 + 回车
+                # Plain command: send text + Enter
                 self.pty.write(line + "\r")
 
     def _wait_exec_result(self, original_cmd, timeout=60):
-        """等待 EXEC 命令完成, 然后通过 cat 读取结果文件并写入本地 result.txt"""
+        """Wait for EXEC command to complete, then read result file and write to local result.txt."""
         result_path = os.path.join(os.path.dirname(self.output_path), "result.txt")
         start = time.time()
 
-        # 等待 DONE 标记出现在屏幕上
+        # Wait for DONE marker to appear on screen
         while time.time() - start < timeout:
             with self.lock:
                 screen_text = "\n".join(self.screen.display)
@@ -407,17 +407,17 @@ class TerminalBridge:
                 break
             time.sleep(0.3)
         else:
-            # 超时
+            # Timeout
             with open(result_path, "w", encoding="utf-8") as f:
                 f.write(f"[TIMEOUT after {timeout}s] cmd: {original_cmd}\n")
             return
 
-        # 用 cat 读取远程结果文件
+        # Read remote result file via cat
         time.sleep(0.3)
         self.pty.write(f"cat {EXEC_RESULT_FILE}\r")
-        time.sleep(1)  # 等待 cat 输出
+        time.sleep(1)  # Wait for cat output
 
-        # 从 pyte 历史 + 屏幕中提取 cat 的输出
+        # Extract cat output from pyte history + screen
         with self.lock:
             all_lines = []
             if hasattr(self.screen, "history") and self.screen.history.top:
@@ -428,7 +428,7 @@ class TerminalBridge:
                     all_lines.append(row_text.rstrip())
             all_lines.extend([r.rstrip() for r in self.screen.display])
 
-        # 找到 cat 命令之后、下一个 prompt 之前的内容
+        # Find content between cat command and next prompt
         result_lines = []
         capturing = False
         cat_cmd = f"cat {EXEC_RESULT_FILE}"
@@ -437,19 +437,19 @@ class TerminalBridge:
                 capturing = True
                 continue
             if capturing:
-                # 检测到 prompt ($ 结尾) 就停止
+                # Stop at prompt (line ending with $)
                 if line.rstrip().endswith("$") and not line.startswith(" "):
                     break
                 result_lines.append(line)
 
-        # 写入本地 result.txt
+        # Write to local result.txt
         with open(result_path, "w", encoding="utf-8") as f:
             f.write(f"[cmd: {original_cmd}]\n")
             f.write(f"[timestamp: {datetime.now().isoformat(timespec='seconds')}]\n")
             f.write("\n".join(result_lines) + "\n")
 
     def _write_status(self):
-        """写入 status.json"""
+        """Write status.json with current bridge state."""
         try:
             status = {
                 "pid": self.pty.pid if self.pty.pid else None,
@@ -480,11 +480,11 @@ def main():
     parser.add_argument("--status", default=None, help="Status file path (default: <dir>/status.json)")
     args = parser.parse_args()
 
-    # 确保工作目录存在
+    # Ensure working directory exists
     bridge_dir = os.path.abspath(args.dir)
     os.makedirs(bridge_dir, exist_ok=True)
 
-    # 解析 IPC 文件路径 (默认放在 --dir 下)
+    # Resolve IPC file paths (default to --dir)
     output_path = args.output or os.path.join(bridge_dir, "output.txt")
     command_path = args.command or os.path.join(bridge_dir, "command.txt")
     status_path = args.status or os.path.join(bridge_dir, "status.json")
