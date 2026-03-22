@@ -1,0 +1,8 @@
+output.txt
+command.txt
+result.txt
+status.json
+*.tmp
+*_backup.py
+__pycache__/
+.claude/
