@@ -4,9 +4,9 @@
 
 ```
 ┌─────────────┐     command.txt      ┌──────────────────┐      PTY       ┌─────────────┐
-│ Claude Code │  ──────────────────> │ terminal_bridge.py│ ────────────> │  SSH Session │
-│ (any project)│ <────────────────── │   (CMD window)   │ <──────────── │   (remote)   │
-└─────────────┘     output.txt       └──────────────────┘               └─────────────┘
+│ Claude Code │  ──────────────────> │terminal_bridge.py│ ────────────>  │ SSH Session │
+│(any project)│ <──────────────────  │   (CMD window)   │ <────────────  │  (remote)   │
+└─────────────┘     output.txt       └──────────────────┘                └─────────────┘
 ```
 
 ## 📋 Requirements
