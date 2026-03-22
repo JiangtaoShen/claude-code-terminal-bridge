@@ -1,4 +1,4 @@
-# Terminal Bridge
+# 🌉 Claude Code Terminal Bridge
 
 **A file-based IPC bridge that lets Claude Code control remote SSH sessions through a Windows CMD terminal, using pywinpty + pyte for real-time screen capture and command injection.**
 
@@ -9,17 +9,17 @@
 └─────────────┘     output.txt       └──────────────────┘               └─────────────┘
 ```
 
-## Requirements
+## 📋 Requirements
 
 - **Windows 10+** (uses ConPTY)
 - **Python 3.8+**
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/<your-username>/claude-code-terminal-bridge.git
+git clone https://github.com/JiangtaoShen/claude-code-terminal-bridge.git
 cd claude-code-terminal-bridge
 pip install -r requirements.txt
 ```
@@ -49,7 +49,7 @@ Claude Code will:
 - **Read** `~/.terminal-bridge/output.txt` to see the terminal screen
 - **Write** `~/.terminal-bridge/command.txt` to send commands
 
-## Command Protocol
+## 📡 Command Protocol
 
 Write commands to `command.txt`. Four formats are supported:
 
@@ -64,7 +64,7 @@ Write commands to `command.txt`. Four formats are supported:
 
 `CTRL+C`, `CTRL+D`, `CTRL+Z`, `CTRL+L`, `CTRL+A`, `CTRL+E`, `CTRL+K`, `CTRL+U`, `CTRL+W`, `CTRL+R`, `ENTER`, `TAB`, `BACKSPACE`, `ESCAPE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `DELETE`, `PAGEUP`, `PAGEDOWN`
 
-## Files
+## 📁 Files
 
 All IPC files are stored in `~/.terminal-bridge/` by default:
 
@@ -75,7 +75,7 @@ All IPC files are stored in `~/.terminal-bridge/` by default:
 | `result.txt` | Bridge → Claude | Full output from `EXEC:` commands |
 | `status.json` | Bridge → Claude | Bridge status (PID, alive, timestamps) |
 
-## CLI Arguments
+## ⚙️ CLI Arguments
 
 ```
 py terminal_bridge.py [OPTIONS]
@@ -103,7 +103,7 @@ py terminal_bridge.py --dir D:\my_project\bridge
 py terminal_bridge.py --shell powershell.exe
 ```
 
-## FAQ
+## ❓ FAQ
 
 **Q: Can I use this from any Claude Code project?**
 
@@ -121,14 +121,10 @@ Use the `EXEC:` prefix — it redirects output to `result.txt` with no line limi
 
 Yes, both manual input and Claude's commands work simultaneously.
 
-## How It Works
+## 🔧 How It Works
 
 1. **pywinpty** creates a Windows pseudo-terminal (ConPTY) running `cmd.exe`
 2. **pyte** renders the raw ANSI escape sequences into readable plain text
 3. A background thread writes the rendered screen to `output.txt` every 0.5s
 4. Another thread polls `command.txt` every 0.2s and forwards commands to the PTY
 5. The Bridge window itself acts as a transparent terminal — you can type directly in it
-
-## License
-
-MIT
