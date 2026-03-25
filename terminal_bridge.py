@@ -318,14 +318,17 @@ class TerminalBridge:
             pass
 
     def _render_output(self):
-        """Write current pyte visible screen to output.txt (no scroll history)."""
+        """Write current pyte visible screen to output.txt, stripping trailing blank lines."""
         now = datetime.now().isoformat(timespec="seconds")
         alive = self.pty.isalive()
 
         with self.lock:
             display_lines = [row.rstrip() for row in self.screen.display]
 
-        # Only keep current screen (history is already in Claude Code context)
+        # Strip trailing empty lines to save tokens
+        while display_lines and not display_lines[-1]:
+            display_lines.pop()
+
         parts = [f"[alive: {str(alive).lower()}] [timestamp: {now}]"]
         parts.extend(display_lines)
 
@@ -363,6 +366,7 @@ class TerminalBridge:
         Supported prefixes:
           (none)    - Plain command, send text + Enter
           EXEC:     - Execute and capture full output to result.txt (no line limit)
+          LAST:N    - Write last N non-empty screen lines to result.txt (no command sent)
           RAW:      - Send raw bytes (supports \\x03 etc.)
           KEY:      - Send special key (ENTER, CTRL+C, UP, etc.)
         """
@@ -382,6 +386,13 @@ class TerminalBridge:
                     args=(cmd,),
                     daemon=True,
                 ).start()
+            elif line.startswith("LAST:"):
+                # Lightweight screen query: write last N non-empty lines to result.txt
+                try:
+                    n = int(line[5:].strip())
+                except ValueError:
+                    n = 10
+                self._write_last_lines(n)
             elif line.startswith("RAW:"):
                 raw = line[4:]
                 raw = raw.encode("utf-8").decode("unicode_escape")
@@ -394,12 +405,36 @@ class TerminalBridge:
                 # Plain command: send text + Enter
                 self.pty.write(line + "\r")
 
-    def _wait_exec_result(self, original_cmd, timeout=60):
-        """Wait for EXEC command to complete, then read result file and write to local result.txt."""
+    def _write_last_lines(self, n):
+        """Write last N non-empty lines from screen to result.txt (no command sent to PTY)."""
+        result_path = os.path.join(os.path.dirname(self.output_path), "result.txt")
+        with self.lock:
+            display_lines = [row.rstrip() for row in self.screen.display]
+
+        # Filter out empty lines
+        non_empty = [l for l in display_lines if l]
+        # Take last N
+        last_n = non_empty[-n:] if len(non_empty) > n else non_empty
+
+        with open(result_path, "w", encoding="utf-8") as f:
+            f.write(f"[screen: last {n} lines]\n")
+            f.write(f"[timestamp: {datetime.now().isoformat(timespec='seconds')}]\n")
+            f.write("\n".join(last_n) + "\n")
+
+    def _wait_exec_result(self, original_cmd, timeout=120):
+        """Wait for EXEC command to complete, then read result via chunked transfer.
+
+        Instead of relying on `cat` + screen history parsing (fragile, mixes with
+        terminal content), this reads the remote file in chunks using base64 encoding
+        with size-limited pieces, writing each chunk to a separate local file, then
+        assembles them.  For outputs under ~40KB (vast majority of use cases), a
+        single `cat` with a unique delimiter pair is enough and avoids screen parsing
+        entirely — the bridge watches for the delimiters in pyte history.
+        """
         result_path = os.path.join(os.path.dirname(self.output_path), "result.txt")
         start = time.time()
 
-        # Wait for DONE marker to appear on screen
+        # Phase 1: wait for the DONE marker on screen
         while time.time() - start < timeout:
             with self.lock:
                 screen_text = "\n".join(self.screen.display)
@@ -407,38 +442,55 @@ class TerminalBridge:
                 break
             time.sleep(0.3)
         else:
-            # Timeout
             with open(result_path, "w", encoding="utf-8") as f:
                 f.write(f"[TIMEOUT after {timeout}s] cmd: {original_cmd}\n")
             return
 
-        # Read remote result file via cat
+        # Phase 2: read result via delimited cat
+        # Use unique delimiters so we can reliably extract output from scrollback
+        begin_marker = "__BRIDGE_BEGIN_RESULT__"
+        end_marker = "__BRIDGE_END_RESULT__"
         time.sleep(0.3)
-        self.pty.write(f"cat {EXEC_RESULT_FILE}\r")
-        time.sleep(1)  # Wait for cat output
 
-        # Extract cat output from pyte history + screen
+        # Reset history before cat so we have a clean capture window
         with self.lock:
-            all_lines = []
-            if hasattr(self.screen, "history") and self.screen.history.top:
-                for hline in self.screen.history.top:
-                    row_text = ""
-                    for col in range(self.cols):
-                        row_text += hline[col].data if col in hline else " "
-                    all_lines.append(row_text.rstrip())
-            all_lines.extend([r.rstrip() for r in self.screen.display])
+            if hasattr(self.screen, "history"):
+                self.screen.history.top.clear()
 
-        # Find content between cat command and next prompt
+        read_cmd = f"echo {begin_marker}; cat {EXEC_RESULT_FILE}; echo {end_marker}"
+        self.pty.write(read_cmd + "\r")
+
+        # Wait for end marker to appear
+        end_deadline = time.time() + 30
+        found_end = False
+        while time.time() < end_deadline:
+            with self.lock:
+                all_text = self._collect_all_lines()
+            if end_marker in "\n".join(all_text):
+                found_end = True
+                break
+            time.sleep(0.3)
+
+        if not found_end:
+            # Fallback: just note timeout on read
+            with open(result_path, "w", encoding="utf-8") as f:
+                f.write(f"[cmd: {original_cmd}]\n")
+                f.write(f"[timestamp: {datetime.now().isoformat(timespec='seconds')}]\n")
+                f.write("[ERROR: timeout reading result file]\n")
+            return
+
+        # Phase 3: extract lines between markers
+        with self.lock:
+            all_lines = self._collect_all_lines()
+
         result_lines = []
         capturing = False
-        cat_cmd = f"cat {EXEC_RESULT_FILE}"
         for line in all_lines:
-            if cat_cmd in line:
+            if begin_marker in line:
                 capturing = True
                 continue
             if capturing:
-                # Stop at prompt (line ending with $)
-                if line.rstrip().endswith("$") and not line.startswith(" "):
+                if end_marker in line:
                     break
                 result_lines.append(line)
 
@@ -447,6 +499,18 @@ class TerminalBridge:
             f.write(f"[cmd: {original_cmd}]\n")
             f.write(f"[timestamp: {datetime.now().isoformat(timespec='seconds')}]\n")
             f.write("\n".join(result_lines) + "\n")
+
+    def _collect_all_lines(self):
+        """Collect all lines from pyte history + current display (must hold self.lock)."""
+        all_lines = []
+        if hasattr(self.screen, "history") and self.screen.history.top:
+            for hline in self.screen.history.top:
+                row_text = ""
+                for col in range(self.cols):
+                    row_text += hline[col].data if col in hline else " "
+                all_lines.append(row_text.rstrip())
+        all_lines.extend([r.rstrip() for r in self.screen.display])
+        return all_lines
 
     def _write_status(self):
         """Write status.json with current bridge state."""

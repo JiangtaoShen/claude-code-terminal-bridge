@@ -1,4 +1,4 @@
-# 🌉 Claude Code Terminal Bridge
+# Claude Code Terminal Bridge
 
 **A file-based IPC bridge that lets Claude Code control remote SSH sessions through a Windows CMD terminal, using pywinpty + pyte for real-time screen capture and command injection.**
 
@@ -9,12 +9,12 @@
 └─────────────┘     output.txt       └──────────────────┘                └─────────────┘
 ```
 
-## 📋 Requirements
+## Requirements
 
 - **Windows 10+** (uses ConPTY)
 - **Python 3.8+**
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Clone & Install
 
@@ -48,34 +48,48 @@ In **any** Claude Code project, tell Claude:
 Claude Code will:
 - **Read** `~/.terminal-bridge/output.txt` to see the terminal screen
 - **Write** `~/.terminal-bridge/command.txt` to send commands
+- **Read** `~/.terminal-bridge/result.txt` to get full command output
 
-## 📡 Command Protocol
+## Command Protocol
 
-Write commands to `command.txt`. Four formats are supported:
+Write commands to `command.txt`. Five formats are supported:
 
 | Prefix | Description | Example |
 |--------|-------------|---------|
 | *(none)* | Send text + Enter | `ls -la` |
 | `EXEC:` | Capture full output to `result.txt` | `EXEC:find / -name "*.log"` |
+| `LAST:N` | Write last N non-empty screen lines to `result.txt` (no command sent) | `LAST:5` |
 | `RAW:` | Send raw bytes | `RAW:\x03` (Ctrl+C) |
 | `KEY:` | Send special key | `KEY:CTRL+C`, `KEY:UP`, `KEY:TAB` |
+
+### When to Use Each
+
+- **Plain command** (`ls -la`): Quick commands where you'll read the screen via `output.txt` afterwards. Output is limited to the visible terminal area.
+- **`EXEC:`**: Long-running commands or commands that produce lots of output. Result is captured to `result.txt` regardless of screen size. Uses unique delimiters for reliable extraction.
+- **`LAST:N`**: Lightweight status check — reads the current screen without sending any command to the terminal. Perfect for checking progress bars, tailing logs, or reading prompts. Costs minimal tokens since only N lines are returned.
 
 ### Supported Keys
 
 `CTRL+C`, `CTRL+D`, `CTRL+Z`, `CTRL+L`, `CTRL+A`, `CTRL+E`, `CTRL+K`, `CTRL+U`, `CTRL+W`, `CTRL+R`, `ENTER`, `TAB`, `BACKSPACE`, `ESCAPE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `DELETE`, `PAGEUP`, `PAGEDOWN`
 
-## 📁 Files
+## Files
 
 All IPC files are stored in `~/.terminal-bridge/` by default:
 
 | File | Direction | Description |
 |------|-----------|-------------|
-| `output.txt` | Bridge → Claude | Current terminal screen content |
-| `command.txt` | Claude → Bridge | Commands to execute |
-| `result.txt` | Bridge → Claude | Full output from `EXEC:` commands |
-| `status.json` | Bridge → Claude | Bridge status (PID, alive, timestamps) |
+| `output.txt` | Bridge -> Claude | Current terminal screen (trailing blank lines stripped) |
+| `command.txt` | Claude -> Bridge | Commands to execute |
+| `result.txt` | Bridge -> Claude | Output from `EXEC:` or `LAST:N` commands |
+| `status.json` | Bridge -> Claude | Bridge status (PID, alive, timestamps) |
 
-## ⚙️ CLI Arguments
+### Token-Saving Design
+
+- **`output.txt`** automatically strips trailing blank lines, so you only pay for lines with actual content instead of a full 40-row screen.
+- **`LAST:N`** lets you check terminal state with just N lines (e.g., `LAST:3` for a quick progress check) — far cheaper than reading the full screen.
+- **`EXEC:`** uses unique delimiters (`__BRIDGE_BEGIN_RESULT__` / `__BRIDGE_END_RESULT__`) for reliable output extraction, avoiding the old approach of screen-history parsing that mixed terminal noise into results.
+
+## CLI Arguments
 
 ```
 py terminal_bridge.py [OPTIONS]
@@ -103,7 +117,7 @@ py terminal_bridge.py --dir D:\my_project\bridge
 py terminal_bridge.py --shell powershell.exe
 ```
 
-## ❓ FAQ
+## FAQ
 
 **Q: Can I use this from any Claude Code project?**
 
@@ -115,16 +129,44 @@ Type passwords directly in the Bridge CMD window. Never send passwords through `
 
 **Q: What if command output is too long?**
 
-Use the `EXEC:` prefix — it redirects output to `result.txt` with no line limit. Or redirect manually: `some_command > /tmp/result.log`.
+Use the `EXEC:` prefix — it redirects output to a temp file on the remote server, then reads it back with unique delimiters for reliable capture. For very large outputs (>50KB), redirect manually: `some_command > /tmp/result.log`.
 
 **Q: Can I still type in the Bridge window while Claude is using it?**
 
 Yes, both manual input and Claude's commands work simultaneously.
 
-## 🔧 How It Works
+**Q: How do I check a running task's progress without wasting tokens?**
+
+Use `LAST:3` or `LAST:5` — it reads only the last few non-empty lines from the current screen without sending any command. Perfect for progress bars and log tails.
+
+## Common Pitfalls
+
+**1. Bridge must be started by the user in a visible CMD window**
+
+Claude Code cannot spawn a visible CMD window via `start cmd /k ...` or background Bash — the Bridge runs inside Claude's invisible subprocess. **The user must manually open CMD and run `py terminal_bridge.py`.**
+
+**2. SSH must be done inside the Bridge window**
+
+The Bridge only captures the PTY it owns. If the user SSHs in a different terminal, the Bridge still shows the local CMD prompt. Always SSH in the window with the `BRIDGE | ...` status bar at the top.
+
+**3. Each Bridge start is a fresh session**
+
+If the Bridge is restarted, the old SSH session is gone. You must SSH again in the new Bridge window. Old `result.txt` / `output.txt` may contain stale content from the previous session — always verify with `LAST:3` after reconnecting.
+
+**4. Don't read `output.txt` to verify command results**
+
+`output.txt` captures the full visible screen and may contain old command history, SSH banners, etc. For command results, always use `EXEC:` (writes clean result to `result.txt`) or `LAST:N` (last N lines only). Only read `output.txt` for debugging connection state.
+
+**5. Prefer `LAST:N` over `output.txt` for status checks**
+
+Reading `output.txt` returns the entire screen (~20-40 lines). `LAST:3` returns only 3 lines to `result.txt`. For progress checks, `LAST:N` saves significant tokens.
+
+## How It Works
 
 1. **pywinpty** creates a Windows pseudo-terminal (ConPTY) running `cmd.exe`
 2. **pyte** renders the raw ANSI escape sequences into readable plain text
-3. A background thread writes the rendered screen to `output.txt` every 0.5s
+3. A background thread writes the rendered screen to `output.txt` every 0.5s (trailing blank lines stripped)
 4. Another thread polls `command.txt` every 0.2s and forwards commands to the PTY
-5. The Bridge window itself acts as a transparent terminal — you can type directly in it
+5. `EXEC:` commands redirect output to a temp file, then read it back using unique delimiters for reliable extraction
+6. `LAST:N` directly reads the pyte screen buffer without sending any command — zero latency, minimal tokens
+7. The Bridge window itself acts as a transparent terminal — you can type directly in it
