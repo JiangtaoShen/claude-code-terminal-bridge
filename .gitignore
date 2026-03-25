@@ -5,4 +5,6 @@ status.json
 *.tmp
 *_backup.py
 __pycache__/
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/*.md

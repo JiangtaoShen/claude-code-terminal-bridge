@@ -161,6 +161,25 @@ If the Bridge is restarted, the old SSH session is gone. You must SSH again in t
 
 Reading `output.txt` returns the entire screen (~20-40 lines). `LAST:3` returns only 3 lines to `result.txt`. For progress checks, `LAST:N` saves significant tokens.
 
+## Claude Code Skill
+
+This project includes a Claude Code skill file (`.claude/skills/terminal-bridge.md`) that teaches Claude how to use the bridge correctly. When you use this project as a Claude Code workspace, the skill is automatically available.
+
+To use the skill in **other projects**, copy it:
+
+```bash
+# Copy to your project
+mkdir -p /path/to/your/project/.claude/skills
+cp .claude/skills/terminal-bridge.md /path/to/your/project/.claude/skills/
+```
+
+The skill encodes best practices learned from real usage:
+- Always use `EXEC:` prefix and read `result.txt` (not `output.txt`)
+- One command at a time — wait for completion before sending the next
+- Use `nohup` for long-running tasks, then monitor with `tail` / `wc -l`
+- Use `LAST:N` for lightweight progress checks
+- Fallback to `output.txt` when `result.txt` is stuck
+
 ## How It Works
 
 1. **pywinpty** creates a Windows pseudo-terminal (ConPTY) running `cmd.exe`
