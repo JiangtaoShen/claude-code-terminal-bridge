@@ -49,24 +49,85 @@ Claude Code will:
 - **Read** `~/.terminal-bridge/output.txt` to see the terminal screen
 - **Write** `~/.terminal-bridge/command.txt` to send commands
 - **Read** `~/.terminal-bridge/result.txt` to get full command output
+- **Read** `~/.terminal-bridge/status.json` to check execution status
 
 ## Command Protocol
 
-Write commands to `command.txt`. Five formats are supported:
+Write commands to `command.txt`. The following formats are supported:
 
 | Prefix | Description | Example |
 |--------|-------------|---------|
 | *(none)* | Send text + Enter | `ls -la` |
-| `EXEC:` | Capture full output to `result.txt` | `EXEC:find / -name "*.log"` |
-| `LAST:N` | Write last N non-empty screen lines to `result.txt` (no command sent) | `LAST:5` |
+| `EXEC:id:cmd` | Capture full output with request ID | `EXEC:req_001:find / -name "*.log"` |
+| `EXEC:CLEAN:id:cmd` | EXEC with ANSI escape cleaning | `EXEC:CLEAN:req_002:cat log.txt` |
+| `QUERY:id:cmd` | Fast query for short output | `QUERY:q_001:nvidia-smi` |
+| `BATCH:id` | Execute multiple commands sequentially | See below |
+| `SCROLLBACK:N` | Export last N lines from scrollback history | `SCROLLBACK:200` |
+| `LAST:N` | Write last N non-empty screen lines to `result.txt` | `LAST:5` |
 | `RAW:` | Send raw bytes | `RAW:\x03` (Ctrl+C) |
 | `KEY:` | Send special key | `KEY:CTRL+C`, `KEY:UP`, `KEY:TAB` |
 
+### Request ID Correlation
+
+Every `EXEC:` and `QUERY:` command includes a unique request ID. The result in `result.txt` includes this ID, so Claude can verify it's reading the correct result:
+
+```
+[req_id: req_001]
+[status: done]
+[exit_code: 0]
+[timestamp: 2026-04-03T02:05:11]
+[duration: 0.3s]
+[cmd: nvidia-smi]
+...output...
+```
+
+### Execution Status in status.json
+
+`status.json` includes an `exec_queue` section showing the current and last completed command:
+
+```json
+{
+  "pty_alive": true,
+  "exec_queue": {
+    "current": {
+      "req_id": "req_003",
+      "cmd": "ps aux | grep train",
+      "status": "running",
+      "started_at": "2026-04-03T02:05:10"
+    },
+    "last_completed": {
+      "req_id": "req_002",
+      "status": "done",
+      "exit_code": 0,
+      "duration_s": 1.2,
+      "completed_at": "2026-04-03T02:05:09"
+    }
+  }
+}
+```
+
+### Batch Execution
+
+Execute multiple commands in a single request:
+
+```
+BATCH:batch_001
+EXEC:nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader
+EXEC:ps aux | grep "python.*train" | grep -v grep
+EXEC:ls -lt ~/output/*pde5* 2>/dev/null
+END_BATCH
+```
+
+Results are separated in `result.txt` with per-command exit codes.
+
 ### When to Use Each
 
-- **Plain command** (`ls -la`): Quick commands where you'll read the screen via `output.txt` afterwards. Output is limited to the visible terminal area.
-- **`EXEC:`**: Long-running commands or commands that produce lots of output. Result is captured to `result.txt` regardless of screen size. Uses unique delimiters for reliable extraction.
-- **`LAST:N`**: Lightweight status check — reads the current screen without sending any command to the terminal. Perfect for checking progress bars, tailing logs, or reading prompts. Costs minimal tokens since only N lines are returned.
+- **`EXEC:id:cmd`**: Standard command execution with full output capture. Uses background shell to avoid terminal noise interference.
+- **`EXEC:CLEAN:id:cmd`**: Same as EXEC but strips ANSI escape sequences. Use when output contains tqdm progress bars, colored text, or other control characters.
+- **`QUERY:id:cmd`**: Fast query for commands with short output (<20 lines). Captures directly from screen, no file redirect needed. 15s timeout.
+- **`BATCH:id`**: Multiple commands executed sequentially in one request. Reduces round-trip overhead.
+- **`SCROLLBACK:N`**: Retrieve scrollback history when the screen has been overwritten by progress bars.
+- **`LAST:N`**: Lightweight status check — reads current screen without sending any command. Minimal tokens.
 
 ### Supported Keys
 
@@ -80,14 +141,16 @@ All IPC files are stored in `~/.terminal-bridge/` by default:
 |------|-----------|-------------|
 | `output.txt` | Bridge -> Claude | Current terminal screen (trailing blank lines stripped) |
 | `command.txt` | Claude -> Bridge | Commands to execute |
-| `result.txt` | Bridge -> Claude | Output from `EXEC:` or `LAST:N` commands |
-| `status.json` | Bridge -> Claude | Bridge status (PID, alive, timestamps) |
+| `result.txt` | Bridge -> Claude | Output from `EXEC:` / `QUERY:` / `BATCH:` / `LAST:N` / `SCROLLBACK:N` |
+| `status.json` | Bridge -> Claude | Bridge status (PID, alive, timestamps, exec queue) |
 
 ### Token-Saving Design
 
 - **`output.txt`** automatically strips trailing blank lines, so you only pay for lines with actual content instead of a full 40-row screen.
 - **`LAST:N`** lets you check terminal state with just N lines (e.g., `LAST:3` for a quick progress check) — far cheaper than reading the full screen.
-- **`EXEC:`** uses unique delimiters (`__BRIDGE_BEGIN_RESULT__` / `__BRIDGE_END_RESULT__`) for reliable output extraction, avoiding the old approach of screen-history parsing that mixed terminal noise into results.
+- **`QUERY:`** captures short outputs directly from screen changes — faster than the full EXEC pipeline.
+- **`BATCH:`** reduces round-trip overhead by executing multiple commands in one request.
+- **Atomic writes**: All result files use `os.replace()` for atomic writes, preventing Claude from reading half-written files.
 
 ## CLI Arguments
 
@@ -129,7 +192,7 @@ Type passwords directly in the Bridge CMD window. Never send passwords through `
 
 **Q: What if command output is too long?**
 
-Use the `EXEC:` prefix — it redirects output to a temp file on the remote server, then reads it back with unique delimiters for reliable capture. For very large outputs (>50KB), redirect manually: `some_command > /tmp/result.log`.
+Use the `EXEC:` prefix — it redirects output to a temp file on the remote server, then reads it back. For very large outputs (>50KB), redirect manually: `some_command > /tmp/result.log`.
 
 **Q: Can I still type in the Bridge window while Claude is using it?**
 
@@ -137,13 +200,17 @@ Yes, both manual input and Claude's commands work simultaneously.
 
 **Q: How do I check a running task's progress without wasting tokens?**
 
-Use `LAST:3` or `LAST:5` — it reads only the last few non-empty lines from the current screen without sending any command. Perfect for progress bars and log tails.
+Use `LAST:3` or `LAST:5` — it reads only the last few non-empty lines from the current screen without sending any command. Or read `status.json` to check `exec_queue.current.status`.
+
+**Q: What about progress bars / ANSI codes in output?**
+
+Use `EXEC:CLEAN:` to automatically strip ANSI escape sequences and carriage returns from output. This solves issues with tqdm progress bars, colored text, and grep returning "Binary file matches".
 
 ## Common Pitfalls
 
 **1. Bridge must be started by the user in a visible CMD window**
 
-Claude Code cannot spawn a visible CMD window via `start cmd /k ...` or background Bash — the Bridge runs inside Claude's invisible subprocess. **The user must manually open CMD and run `py terminal_bridge.py`.**
+Claude Code cannot spawn a visible CMD window — the Bridge runs inside Claude's invisible subprocess. **The user must manually open CMD and run `py terminal_bridge.py`.**
 
 **2. SSH must be done inside the Bridge window**
 
@@ -151,15 +218,19 @@ The Bridge only captures the PTY it owns. If the user SSHs in a different termin
 
 **3. Each Bridge start is a fresh session**
 
-If the Bridge is restarted, the old SSH session is gone. You must SSH again in the new Bridge window. Old `result.txt` / `output.txt` may contain stale content from the previous session — always verify with `LAST:3` after reconnecting.
+If the Bridge is restarted, the old SSH session is gone. You must SSH again in the new Bridge window.
 
-**4. Don't read `output.txt` to verify command results**
+**4. Always verify request IDs in result.txt**
 
-`output.txt` captures the full visible screen and may contain old command history, SSH banners, etc. For command results, always use `EXEC:` (writes clean result to `result.txt`) or `LAST:N` (last N lines only). Only read `output.txt` for debugging connection state.
+With the request ID system, always check that `[req_id: ...]` in result.txt matches your request before trusting the output. This prevents reading stale results from previous commands.
 
-**5. Prefer `LAST:N` over `output.txt` for status checks**
+**5. Use EXEC:CLEAN for log files with ANSI codes**
 
-Reading `output.txt` returns the entire screen (~20-40 lines). `LAST:3` returns only 3 lines to `result.txt`. For progress checks, `LAST:N` saves significant tokens.
+Remote log files with tqdm progress bars contain ANSI escape sequences that can confuse grep and produce garbled output. The CLEAN variant strips these automatically.
+
+**6. Prefer BATCH for multiple queries**
+
+Instead of sending 3 separate EXEC commands with sleep between each, use a single BATCH command. This reduces total latency and gives structured per-command results.
 
 ## Claude Code Skill
 
@@ -173,19 +244,16 @@ mkdir -p /path/to/your/project/.claude/skills
 cp .claude/skills/terminal-bridge.md /path/to/your/project/.claude/skills/
 ```
 
-The skill encodes best practices learned from real usage:
-- Always use `EXEC:` prefix and read `result.txt` (not `output.txt`)
-- One command at a time — wait for completion before sending the next
-- Use `nohup` for long-running tasks, then monitor with `tail` / `wc -l`
-- Use `LAST:N` for lightweight progress checks
-- Fallback to `output.txt` when `result.txt` is stuck
-
 ## How It Works
 
 1. **pywinpty** creates a Windows pseudo-terminal (ConPTY) running `cmd.exe`
 2. **pyte** renders the raw ANSI escape sequences into readable plain text
 3. A background thread writes the rendered screen to `output.txt` every 0.5s (trailing blank lines stripped)
 4. Another thread polls `command.txt` every 0.2s and forwards commands to the PTY
-5. `EXEC:` commands redirect output to a temp file, then read it back using unique delimiters for reliable extraction
-6. `LAST:N` directly reads the pyte screen buffer without sending any command — zero latency, minimal tokens
-7. The Bridge window itself acts as a transparent terminal — you can type directly in it
+5. `EXEC:` commands execute in a background shell (independent from terminal stream) and write results to a temp file, then read it back using unique per-request delimiters
+6. `QUERY:` captures short outputs directly from screen changes for low-latency results
+7. `BATCH:` executes multiple commands sequentially with structured per-command results
+8. `SCROLLBACK:` exports pyte history buffer for retrieving output pushed off screen
+9. All file writes use `os.replace()` for atomicity — no half-written files
+10. `status.json` includes an `exec_queue` with current/last_completed states for deterministic polling
+11. The Bridge window itself acts as a transparent terminal — you can type directly in it
