@@ -56,6 +56,7 @@ def _get_clipboard_text():
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
+BRIDGE_VERSION = "2.0.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BRIDGE_DIR = os.path.join(os.path.expanduser("~"), ".terminal-bridge")
 DEFAULT_COLS = 120
@@ -65,9 +66,6 @@ SCREEN_CAPTURE_INTERVAL = 0.5   # seconds
 COMMAND_POLL_INTERVAL = 0.2     # seconds
 PTY_READ_INTERVAL = 0.05        # seconds
 DISPLAY_REFRESH_INTERVAL = 0.3  # seconds - console refresh interval
-EXEC_RESULT_FILE = "/tmp/bridge_result.txt"  # temp file on remote server
-EXEC_SIGNAL_FILE = "/tmp/bridge_signal.txt"  # completion signal file on remote
-EXEC_DONE_MARKER = "__BRIDGE_DONE_8f3a__"    # command completion marker
 
 # ANSI escape sequence pattern for cleaning
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\r')
@@ -116,6 +114,7 @@ class TerminalBridge:
         self.lock = threading.Lock()
 
         # Exec queue state (for status.json)
+        self._cmd_lock = threading.Lock()   # Serialize PTY command execution
         self._exec_lock = threading.Lock()
         self._exec_current = None      # dict: req_id, cmd, status, started_at
         self._exec_last_completed = None  # dict: req_id, status, exit_code, duration_s, completed_at
@@ -153,7 +152,7 @@ class TerminalBridge:
     def start(self):
         """Start all background threads; main thread handles keyboard input."""
         # Startup diagnostics
-        print(f"[Bridge] Window: {self.win_cols}x{self.win_rows}, PTY: {self.cols}x{self.rows}")
+        print(f"[Bridge v{BRIDGE_VERSION}] Window: {self.win_cols}x{self.win_rows}, PTY: {self.cols}x{self.rows}")
         print(f"[Bridge] Starting in 3 seconds...")
         time.sleep(3)
 
@@ -407,7 +406,7 @@ class TerminalBridge:
                 req_id, cmd = self._parse_req_id_cmd(rest)
                 if req_id and cmd:
                     threading.Thread(
-                        target=self._exec_silent,
+                        target=self._exec_pty,
                         args=(cmd, req_id, True),
                         daemon=True,
                     ).start()
@@ -417,18 +416,18 @@ class TerminalBridge:
                 req_id, cmd = self._parse_req_id_cmd(rest)
                 if req_id and cmd:
                     threading.Thread(
-                        target=self._exec_silent,
+                        target=self._exec_pty,
                         args=(cmd, req_id, False),
                         daemon=True,
                     ).start()
             elif line.startswith("QUERY:"):
-                # Fast query: QUERY:req_id:command
+                # Fast query: QUERY:req_id:command (shorter timeout)
                 rest = line[6:]
                 req_id, cmd = self._parse_req_id_cmd(rest)
                 if req_id and cmd:
                     threading.Thread(
-                        target=self._exec_query,
-                        args=(cmd, req_id),
+                        target=self._exec_pty,
+                        args=(cmd, req_id, False, 30),
                         daemon=True,
                     ).start()
             elif line.startswith("BATCH:"):
@@ -444,7 +443,7 @@ class TerminalBridge:
                         batch_cmds.append(bline[5:].strip())
                 if batch_id and batch_cmds:
                     threading.Thread(
-                        target=self._exec_batch,
+                        target=self._exec_batch_pty,
                         args=(batch_id, batch_cmds),
                         daemon=True,
                     ).start()
@@ -521,272 +520,119 @@ class TerminalBridge:
                 self._exec_current = None
         self._write_status()
 
-    # ─── EXEC: Silent execution via background shell ─────────────────────────
+    # ─── PTY-through execution (works through SSH) ────────────────────────
 
-    def _exec_silent(self, cmd, req_id, clean=False, timeout=120):
-        """Execute command in background shell, write result to file. Does not mix with terminal stream."""
-        self._set_exec_state(req_id, cmd, "running")
-        start = time.time()
+    def _send_and_capture(self, cmd, req_id, timeout=120):
+        """Send command through PTY with start/end markers and capture output.
 
-        # Wrap command to execute in background, capture output, and write signal file
-        if clean:
-            # Pipe through sed to strip ANSI escapes, then tr to remove \r
-            wrapped = (
-                f"{{ {{ {cmd}; }} 2>&1 | sed 's/\\x1b\\[[0-9;]*[a-zA-Z]//g' | tr -d '\\r'; }} "
-                f"> {EXEC_RESULT_FILE}; "
-                f"echo \"$?\" > {EXEC_SIGNAL_FILE}; "
-                f"echo {req_id} >> {EXEC_SIGNAL_FILE}"
-            )
-        else:
-            wrapped = (
-                f"{{ {cmd}; }} > {EXEC_RESULT_FILE} 2>&1; "
-                f"echo \"$?\" > {EXEC_SIGNAL_FILE}; "
-                f"echo {req_id} >> {EXEC_SIGNAL_FILE}"
-            )
+        Caller must hold _cmd_lock. Returns (result_lines, exit_code).
+        The command is sent as: echo <START>; <cmd>; echo <END> $?
+        Output between markers is captured from pyte history + screen.
+        """
+        start_marker = f"__S_{req_id}__"
+        end_marker = f"__E_{req_id}__"
 
-        self.pty.write(f"({wrapped}) &\r")
-
-        # Poll for signal file containing our req_id
-        poll_cmd_sent = False
-        exit_code = None
-        while time.time() - start < timeout:
-            time.sleep(0.5)
-            # Send a cat command to check signal file
-            if not poll_cmd_sent:
-                time.sleep(0.3)
-                poll_cmd_sent = True
-
-            # Check screen for signal
-            with self.lock:
-                all_text = "\n".join(self.screen.display)
-
-            # Also try reading signal via a quick check
-            check_marker = f"__CHK_{req_id}__"
-            self.pty.write(f"cat {EXEC_SIGNAL_FILE} 2>/dev/null && echo {check_marker}\r")
-            time.sleep(0.5)
-
-            with self.lock:
-                screen_text = "\n".join(self._collect_all_lines())
-
-            if check_marker in screen_text and req_id in screen_text:
-                # Extract exit code from signal file content shown on screen
-                for sline in screen_text.split("\n"):
-                    sline = sline.strip()
-                    if sline.isdigit() or (sline.startswith("-") and sline[1:].isdigit()):
-                        try:
-                            exit_code = int(sline)
-                        except ValueError:
-                            pass
-                break
-        else:
-            # Timeout
-            self._set_exec_state(req_id, cmd, "done", exit_code=-1)
-            self._write_result_file(req_id, cmd, "[TIMEOUT]", exit_code=-1)
-            return
-
-        # Read the result file content
-        time.sleep(0.2)
-        begin_marker = f"__BR_{req_id}__"
-        end_marker = f"__ER_{req_id}__"
-
+        # Clear scrollback history for clean capture
         with self.lock:
             if hasattr(self.screen, "history"):
                 self.screen.history.top.clear()
 
-        self.pty.write(f"echo {begin_marker}; cat {EXEC_RESULT_FILE}; echo {end_marker}\r")
+        # Send command with markers through PTY
+        self.pty.write(f"echo {start_marker}; {cmd}; echo {end_marker} $?\r")
 
-        # Wait for end marker
-        deadline = time.time() + 30
+        # Wait for end marker output to appear on screen
+        start_time = time.time()
         found = False
-        while time.time() < deadline:
+        while time.time() - start_time < timeout:
             time.sleep(0.3)
             with self.lock:
                 all_lines = self._collect_all_lines()
-            if end_marker in "\n".join(all_lines):
-                found = True
+            for line in all_lines:
+                if line.strip().startswith(end_marker):
+                    found = True
+                    break
+            if found:
                 break
 
         if not found:
-            self._set_exec_state(req_id, cmd, "done", exit_code=exit_code)
-            self._write_result_file(req_id, cmd, "[ERROR: timeout reading result]", exit_code=exit_code)
-            return
+            # Timeout - send Ctrl+C to cancel hung command
+            self.pty.write("\x03")
+            time.sleep(0.5)
+            return ["[TIMEOUT]"], -1
 
-        # Extract result between markers
+        # Small delay for screen to stabilize
+        time.sleep(0.2)
+
+        # Extract output between markers
         with self.lock:
             all_lines = self._collect_all_lines()
 
         result_lines = []
+        exit_code = 0
         capturing = False
-        for rline in all_lines:
-            if begin_marker in rline:
-                capturing = True
+        for line in all_lines:
+            stripped = line.strip()
+            if not capturing:
+                # Match the echo output line (no shell prompt prefix)
+                if stripped == start_marker:
+                    capturing = True
                 continue
-            if capturing:
-                if end_marker in rline:
-                    break
-                result_lines.append(rline)
-
-        result_text = "\n".join(result_lines)
-        if clean:
-            result_text = self._clean_ansi(result_text)
-
-        self._set_exec_state(req_id, cmd, "done", exit_code=exit_code)
-        self._write_result_file(req_id, cmd, result_text, exit_code=exit_code)
-
-    # ─── QUERY: Fast lightweight query ───────────────────────────────────────
-
-    def _exec_query(self, cmd, req_id, timeout=15):
-        """Fast query: send command, wait for prompt to return, capture output from screen."""
-        self._set_exec_state(req_id, cmd, "running")
-
-        # Record pre-execution screen state
-        with self.lock:
-            pre_cursor_y = self.screen.cursor.y
-
-        # Use a unique end marker to detect completion
-        end_marker = f"__Q_{req_id}__"
-        self.pty.write(f"{cmd}; echo {end_marker}\r")
-
-        # Wait for marker to appear on screen
-        start = time.time()
-        while time.time() - start < timeout:
-            time.sleep(0.2)
-            with self.lock:
-                all_lines = self._collect_all_lines()
-            full_text = "\n".join(all_lines)
-            if end_marker in full_text:
+            if stripped.startswith(end_marker):
+                # Parse exit code from: __E_req_id__ <exit_code>
+                remainder = stripped[len(end_marker):].strip()
+                try:
+                    exit_code = int(remainder)
+                except ValueError:
+                    pass
                 break
-        else:
-            self._set_exec_state(req_id, cmd, "done", exit_code=-1)
-            self._write_result_file(req_id, cmd, "[TIMEOUT]", exit_code=-1)
-            return
+            result_lines.append(line)
 
-        # Extract output between the command echo and the marker
-        with self.lock:
-            all_lines = self._collect_all_lines()
+        return result_lines, exit_code
 
-        result_lines = []
-        found_cmd = False
-        for qline in all_lines:
-            if end_marker in qline:
-                break
-            if found_cmd:
-                result_lines.append(qline)
-            elif cmd in qline or end_marker.split("__")[0] in qline:
-                found_cmd = True
+    def _exec_pty(self, cmd, req_id, clean=False, timeout=120):
+        """Execute command through PTY. Thread-safe entry point for EXEC/QUERY."""
+        with self._cmd_lock:
+            self._set_exec_state(req_id, cmd, "running")
+            result_lines, exit_code = self._send_and_capture(cmd, req_id, timeout)
+            while result_lines and not result_lines[-1].strip():
+                result_lines.pop()
+            result_text = "\n".join(result_lines)
+            if clean:
+                result_text = self._clean_ansi(result_text)
+            self._set_exec_state(req_id, cmd, "done", exit_code=exit_code)
+            self._write_result_file(req_id, cmd, result_text, exit_code=exit_code)
 
-        # If we didn't find the command echo, just take lines before marker
-        if not result_lines:
-            capturing = False
-            for qline in reversed(all_lines):
-                if end_marker in qline:
-                    capturing = True
-                    continue
-                if capturing:
-                    if qline.strip() and (qline.strip().endswith("$") or qline.strip().endswith("#")):
-                        break
-                    result_lines.insert(0, qline)
+    def _exec_batch_pty(self, batch_id, cmds, timeout_per_cmd=120):
+        """Execute multiple commands sequentially through PTY."""
+        with self._cmd_lock:
+            self._set_exec_state(batch_id, f"BATCH({len(cmds)} cmds)", "running")
 
-        result_text = "\n".join(result_lines)
-        self._set_exec_state(req_id, cmd, "done", exit_code=0)
-        self._write_result_file(req_id, cmd, result_text, exit_code=0)
+            total = len(cmds)
+            all_results = [f"[batch_id: {batch_id}]", f"[total: {total}]", ""]
 
-    # ─── BATCH: Multi-command sequential execution ───────────────────────────
+            for idx, cmd in enumerate(cmds, 1):
+                sub_req_id = f"{batch_id}_{idx}"
+                result_lines, exit_code = self._send_and_capture(
+                    cmd, sub_req_id, timeout_per_cmd
+                )
+                while result_lines and not result_lines[-1].strip():
+                    result_lines.pop()
+                all_results.append(f"--- [{idx}/{total}] {cmd} ---")
+                all_results.append(f"[exit_code: {exit_code}]")
+                all_results.extend(result_lines)
+                all_results.append("")
 
-    def _exec_batch(self, batch_id, cmds, timeout_per_cmd=120):
-        """Execute multiple commands sequentially, write all results to result.txt."""
-        self._set_exec_state(batch_id, f"BATCH({len(cmds)} cmds)", "running")
+            all_results.append("[batch_status: done]")
 
-        total = len(cmds)
-        all_results = []
-        all_results.append(f"[batch_id: {batch_id}]")
-        all_results.append(f"[total: {total}]")
-        all_results.append("")
+            self._set_exec_state(batch_id, f"BATCH({total} cmds)", "done", exit_code=0)
 
-        for idx, cmd in enumerate(cmds, 1):
-            sub_req_id = f"{batch_id}_{idx}"
-            start = time.time()
-
-            # Execute each command using signal file approach
-            wrapped = (
-                f"{{ {cmd}; }} > {EXEC_RESULT_FILE} 2>&1; "
-                f"echo \"$?\" > {EXEC_SIGNAL_FILE}; "
-                f"echo {sub_req_id} >> {EXEC_SIGNAL_FILE}"
+            now = datetime.now().isoformat(timespec="seconds")
+            content = (
+                f"[batch_id: {batch_id}]\n"
+                f"[timestamp: {now}]\n"
+                + "\n".join(all_results) + "\n"
             )
-            self.pty.write(f"({wrapped})\r")
-
-            # Wait for signal
-            exit_code = None
-            while time.time() - start < timeout_per_cmd:
-                time.sleep(0.5)
-                check_marker = f"__BC_{sub_req_id}__"
-                self.pty.write(f"cat {EXEC_SIGNAL_FILE} 2>/dev/null && echo {check_marker}\r")
-                time.sleep(0.5)
-
-                with self.lock:
-                    screen_text = "\n".join(self._collect_all_lines())
-
-                if check_marker in screen_text and sub_req_id in screen_text:
-                    for sline in screen_text.split("\n"):
-                        sline = sline.strip()
-                        if sline.isdigit():
-                            try:
-                                exit_code = int(sline)
-                            except ValueError:
-                                pass
-                    break
-
-            # Read result
-            time.sleep(0.2)
-            begin_m = f"__BB_{sub_req_id}__"
-            end_m = f"__BE_{sub_req_id}__"
-
-            with self.lock:
-                if hasattr(self.screen, "history"):
-                    self.screen.history.top.clear()
-
-            self.pty.write(f"echo {begin_m}; cat {EXEC_RESULT_FILE}; echo {end_m}\r")
-
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                time.sleep(0.3)
-                with self.lock:
-                    alines = self._collect_all_lines()
-                if end_m in "\n".join(alines):
-                    break
-
-            with self.lock:
-                alines = self._collect_all_lines()
-
-            result_lines = []
-            capturing = False
-            for rline in alines:
-                if begin_m in rline:
-                    capturing = True
-                    continue
-                if capturing:
-                    if end_m in rline:
-                        break
-                    result_lines.append(rline)
-
-            duration = round(time.time() - start, 1)
-            all_results.append(f"--- [{idx}/{total}] {cmd} ---")
-            all_results.append(f"[exit_code: {exit_code}]")
-            all_results.extend(result_lines)
-            all_results.append("")
-
-        all_results.append(f"[batch_status: done]")
-
-        self._set_exec_state(batch_id, f"BATCH({total} cmds)", "done", exit_code=0)
-        result_content = "\n".join(all_results)
-
-        now = datetime.now().isoformat(timespec="seconds")
-        content = (
-            f"[batch_id: {batch_id}]\n"
-            f"[timestamp: {now}]\n"
-            f"{result_content}\n"
-        )
-        self._atomic_write(self.result_path, content)
+            self._atomic_write(self.result_path, content)
 
     # ─── SCROLLBACK: History export ──────────────────────────────────────────
 
@@ -876,6 +722,7 @@ class TerminalBridge:
                     exec_queue["last_completed"] = dict(self._exec_last_completed)
 
             status = {
+                "version": BRIDGE_VERSION,
                 "pid": self.pty.pid if self.pty.pid else None,
                 "pty_alive": self.pty.isalive(),
                 "shell": self.shell,
@@ -908,6 +755,24 @@ def main():
     # Ensure working directory exists
     bridge_dir = os.path.abspath(args.dir)
     os.makedirs(bridge_dir, exist_ok=True)
+
+    # Single-instance lock
+    lock_path = os.path.join(bridge_dir, "bridge.lock")
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        os.write(lock_fd, str(os.getpid()).encode())
+        os.ftruncate(lock_fd, len(str(os.getpid())))
+    except OSError:
+        try:
+            with open(lock_path, "r") as f:
+                old_pid = f.read().strip()
+        except Exception:
+            old_pid = "unknown"
+        print(f"[Bridge] ERROR: Another bridge is already running (PID: {old_pid})")
+        print(f"[Bridge] Close the other bridge window first, or: taskkill /F /PID {old_pid}")
+        sys.exit(1)
 
     # Resolve IPC file paths (default to --dir)
     output_path = args.output or os.path.join(bridge_dir, "output.txt")

@@ -16,205 +16,159 @@ The user must have **manually**:
 
 **You cannot start the bridge or enter SSH passwords.** If the bridge is not running, ask the user to start it.
 
-## IPC Files
+The bridge has **single-instance protection** -- if an old bridge is still running, the new one will show an error with the old PID. The user needs to close the old bridge first.
 
-| File | Direction | Purpose |
-|------|-----------|---------|
-| `~/.terminal-bridge/command.txt` | You → Bridge | Write commands here |
-| `~/.terminal-bridge/result.txt` | Bridge → You | Clean output from EXEC/QUERY/BATCH/LAST/SCROLLBACK |
-| `~/.terminal-bridge/output.txt` | Bridge → You | Raw terminal screen (fallback only) |
-| `~/.terminal-bridge/status.json` | Bridge → You | Bridge status, timestamps & exec queue state |
+## Executing Remote Commands
 
-## How to Execute a Remote Command
+### Primary method: `bridge_run.py` (recommended)
 
-**Standard pattern — always use request IDs:**
+One command does everything: write, poll, read.
 
 ```bash
-echo "EXEC:req_001:your_command_here" > ~/.terminal-bridge/command.txt
+py D:/remote_control/bridge_run.py "your_command_here"
 ```
 
-Then poll `status.json` to check completion:
+Examples:
+```bash
+# Single command
+py D:/remote_control/bridge_run.py "ls ~/ch5_exp/output_ch5/"
+
+# Strip ANSI escape codes (for logs with color/progress bars)
+py D:/remote_control/bridge_run.py --clean "tail -50 ~/train.log"
+
+# Custom timeout (default: 130s)
+py D:/remote_control/bridge_run.py --timeout 30 "pwd"
+
+# Output only (skip metadata header) -- saves tokens
+py D:/remote_control/bridge_run.py --raw "nvidia-smi"
+
+# Check SSH connection
+py D:/remote_control/bridge_run.py --last 3
+
+# Read scrollback history
+py D:/remote_control/bridge_run.py --scroll 200
+
+# Show bridge status
+py D:/remote_control/bridge_run.py --status
+```
+
+The exit code matches the remote command's exit code. TIMEOUT returns 124.
+
+### Fallback method: manual IPC
+
+Use only when `bridge_run.py` is unavailable.
 
 ```bash
+echo "EXEC:req_001:your_command" > ~/.terminal-bridge/command.txt
+# Poll status.json for completion
 cat ~/.terminal-bridge/status.json
-```
-
-Look for `exec_queue.last_completed.req_id == "req_001"` and `status == "done"`. Once confirmed, read the result:
-
-```bash
+# Then read result
 cat ~/.terminal-bridge/result.txt
 ```
 
-The result includes structured metadata:
-```
-[req_id: req_001]
-[status: done]
-[exit_code: 0]
-[timestamp: 2026-04-03T02:05:11]
-[duration: 0.3s]
-[cmd: nvidia-smi]
-...actual output...
-```
-
-**One-liner for simple cases:**
-
-```bash
-echo "EXEC:req_001:your_command" > ~/.terminal-bridge/command.txt && sleep 5 && cat ~/.terminal-bridge/result.txt
-```
-
-Verify `[req_id: req_001]` in the output matches your request before trusting the result.
-
 ## Command Types
 
-### EXEC — Full output capture with request ID
+### EXEC — Execute and capture output (default)
 
 ```bash
-echo "EXEC:req_001:nvidia-smi" > ~/.terminal-bridge/command.txt
+py D:/remote_control/bridge_run.py "nvidia-smi"
 ```
 
-- Executes in a background shell, does not mix with terminal stream
-- Result written to result.txt with structured metadata (req_id, exit_code, timestamp, duration)
-- Always include a unique req_id to correlate request with response
+- Sends command through the PTY with start/end markers
+- Output captured from pyte screen between markers
+- Works transparently through SSH sessions
+- Default timeout: 120s (bridge-side), 130s (poll-side)
 
 ### EXEC:CLEAN — EXEC with ANSI escape cleaning
 
 ```bash
-echo "EXEC:CLEAN:req_002:cat ~/log.log | grep Finished" > ~/.terminal-bridge/command.txt
+py D:/remote_control/bridge_run.py --clean "cat ~/log.log | grep Finished"
 ```
-
-- Same as EXEC but automatically strips ANSI escape sequences and `\r` from output
-- Use when remote output contains tqdm progress bars, colored text, or other ANSI codes
-
-### QUERY — Fast lightweight query
-
-```bash
-echo "QUERY:req_003:nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader" > ~/.terminal-bridge/command.txt
-```
-
-- For short output commands (<20 lines)
-- Captures output directly from screen changes (no file redirect on remote)
-- Faster than EXEC for quick checks, 15s timeout
 
 ### BATCH — Multiple commands in one request
 
-```bash
-printf "BATCH:batch_001\nEXEC:nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader\nEXEC:ps aux | grep train\nEXEC:ls -lt ~/output/ | head -5\nEND_BATCH" > ~/.terminal-bridge/command.txt
-```
-
-- Executes commands sequentially, results separated in result.txt
-- Each command's exit code is tracked
-- Reduces round-trip overhead vs sending 3 separate EXECs
-
-### SCROLLBACK — Export scrollback history
+BATCH requires manual IPC (not yet in bridge_run.py):
 
 ```bash
-echo "SCROLLBACK:200" > ~/.terminal-bridge/command.txt && sleep 2 && cat ~/.terminal-bridge/result.txt
+printf "BATCH:batch_001\nEXEC:nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader\nEXEC:ps aux | grep python | grep -v grep\nEXEC:ls -lt ~/output/ | head -5\nEND_BATCH" > ~/.terminal-bridge/command.txt
 ```
 
-- Exports last N lines from pyte scrollback history + current display
-- Use when screen was overwritten by progress bars but you need earlier output
+Then poll `status.json` for `batch_001` completion and read `result.txt`.
 
 ### LAST — Quick screen check (no command sent)
 
 ```bash
-echo "LAST:5" > ~/.terminal-bridge/command.txt && sleep 2 && cat ~/.terminal-bridge/result.txt
+py D:/remote_control/bridge_run.py --last 5
 ```
 
-- Reads last N non-empty lines from current screen without sending any command
-- Perfect for checking progress bars, prompts, or connection state
+### SCROLLBACK — Export scrollback history
+
+```bash
+py D:/remote_control/bridge_run.py --scroll 200
+```
 
 ### RAW / KEY — Send raw bytes or special keys
 
 ```bash
-echo "KEY:CTRL+C" > ~/.terminal-bridge/command.txt    # Cancel running command
-echo "KEY:CTRL+D" > ~/.terminal-bridge/command.txt    # EOF / logout
-echo "RAW:\x03" > ~/.terminal-bridge/command.txt      # Same as CTRL+C
+echo "KEY:CTRL+C" > ~/.terminal-bridge/command.txt
+echo "KEY:CTRL+D" > ~/.terminal-bridge/command.txt
 ```
 
-## Checking Execution Status
+## Result Format
 
-Read `status.json` to check if a command is still running:
-
-```bash
-cat ~/.terminal-bridge/status.json
+```
+[req_id: r42871]
+[status: done]
+[exit_code: 0]
+[timestamp: 2026-04-03T16:46:25]
+[duration: 1.6s]
+[cmd: ls ~/ch5_exp/output_ch5/]
+table1  table2  table3
 ```
 
-The `exec_queue` field shows:
-```json
-{
-  "exec_queue": {
-    "current": {
-      "req_id": "req_003",
-      "cmd": "ps aux | grep train",
-      "status": "running",
-      "started_at": "2026-04-03T02:05:10"
-    },
-    "last_completed": {
-      "req_id": "req_002",
-      "status": "done",
-      "exit_code": 0,
-      "duration_s": 1.2,
-      "completed_at": "2026-04-03T02:05:09"
-    }
-  }
-}
-```
-
-**Polling pattern:**
-1. Generate unique req_id, write EXEC command
-2. Poll `status.json` until `exec_queue.last_completed.req_id` matches your req_id
-3. Read `result.txt` — verify `[req_id:]` matches
+Use `--raw` flag to skip the metadata header and get only the command output.
 
 ## Critical Rules
 
-1. **Always use request IDs.** Every EXEC/QUERY command must include a unique req_id. Verify req_id in result.txt matches before trusting the output.
+1. **Commands are serialized.** The bridge holds a lock so only one EXEC/QUERY/BATCH runs at a time. Safe to send new commands after completion.
 
-2. **ONE command at a time.** Never send a new EXEC before the previous one completes. Check status.json before sending the next command.
+2. **Never send passwords via command.txt.** SSH passwords must be typed manually in the bridge window.
 
-3. **Never send passwords via command.txt.** SSH passwords must be typed manually in the bridge window.
-
-4. **Use nohup for long-running tasks.** Don't EXEC a command that runs for hours — it will timeout (120s). Instead:
+3. **Use nohup for long-running tasks.** Don't EXEC a command that runs for hours -- it will timeout. Instead:
+   ```bash
+   py D:/remote_control/bridge_run.py "nohup python -u script.py > log.txt 2>&1 & echo PID=\$!"
    ```
-   EXEC:req_010:nohup python -u script.py > log.txt 2>&1 & echo PID=$!
-   ```
-   Then monitor with `EXEC:req_011:tail -5 log.txt`.
+   Then monitor with `py D:/remote_control/bridge_run.py "tail -5 log.txt"`.
 
-5. **Use EXEC:CLEAN for logs with ANSI codes.** If grep returns "Binary file matches" or output is garbled with escape sequences, use the CLEAN variant.
+4. **Verify SSH before first command.** Use `--last 3` to check for a Linux prompt (`[user@host ~]$`). If you see a Windows prompt, ask the user to SSH in.
 
-6. **Use BATCH for multiple queries.** Instead of sending 3 separate EXECs with sleep between each, send a single BATCH command.
-
-7. **Use SCROLLBACK when screen is overwritten.** If progress bars have pushed useful output off screen, `SCROLLBACK:200` retrieves history.
-
-8. **After bridge reconnect**, always verify the session first:
-   ```
-   echo "LAST:3" > ~/.terminal-bridge/command.txt && sleep 3 && cat ~/.terminal-bridge/result.txt
-   ```
+5. **Check version after restart.** Use `--status` and verify the `version` field matches expected version.
 
 ## Common Workflows
 
-### Check GPU + processes + files in one call
+### Check experiment progress
 ```bash
-printf "BATCH:chk_001\nEXEC:nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader\nEXEC:ps aux | grep python.*train | grep -v grep\nEXEC:ls -lt ~/output/ | head -5\nEND_BATCH" > ~/.terminal-bridge/command.txt && sleep 15 && cat ~/.terminal-bridge/result.txt
+py D:/remote_control/bridge_run.py "ls ~/output/ | wc -l"
+```
+
+### GPU + processes check
+```bash
+printf "BATCH:chk\nEXEC:nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader\nEXEC:ps aux | grep python | grep -v grep\nEND_BATCH" > ~/.terminal-bridge/command.txt && sleep 15 && cat ~/.terminal-bridge/result.txt
 ```
 
 ### Read log with ANSI cleaning
 ```bash
-echo "EXEC:CLEAN:log_001:tail -50 ~/train.log | grep -i 'epoch\|loss\|accuracy'" > ~/.terminal-bridge/command.txt && sleep 8 && cat ~/.terminal-bridge/result.txt
-```
-
-### Quick GPU check
-```bash
-echo "QUERY:gpu_001:nvidia-smi --query-gpu=index,utilization.gpu --format=csv,noheader" > ~/.terminal-bridge/command.txt && sleep 3 && cat ~/.terminal-bridge/result.txt
+py D:/remote_control/bridge_run.py --clean "tail -50 ~/train.log | grep -i 'epoch\|loss'"
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| result.txt shows wrong req_id | Result is from a previous command — poll status.json until your req_id appears in last_completed |
-| result.txt not updating | Check status.json exec_queue.current — command may still be running |
-| Output garbled with escape codes | Use `EXEC:CLEAN:` variant to strip ANSI escapes |
-| Screen overwritten by progress bars | Use `SCROLLBACK:200` to retrieve history |
-| Bridge exited | Ask user to restart: `py D:\remote_control\terminal_bridge.py` then SSH again |
-| SSH disconnected | Check output.txt for `Connection reset`. Ask user to SSH again in bridge window |
-| Command timeout (120s) | Use nohup for long commands; EXEC is for commands that finish quickly |
+| "Bridge not running" error | Ask user to start: `py D:\remote_control\terminal_bridge.py` |
+| "Another bridge is already running" | User must close old bridge window first, or `taskkill /F /PID <pid>` |
+| TIMEOUT on commands | Check if SSH is connected (`--last 3`). Increase `--timeout` if command is slow. |
+| Output garbled with escape codes | Use `--clean` flag |
+| Not sure if new code is loaded | Use `--status`, check `version` field |
+| SSH disconnected | Use `--last 3` to verify. Ask user to SSH again in bridge window |
+| Command timeout (120s) | Use nohup for long commands |
