@@ -56,7 +56,7 @@ def _get_clipboard_text():
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.1.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BRIDGE_DIR = os.path.join(os.path.expanduser("~"), ".terminal-bridge")
 DEFAULT_COLS = 120
@@ -555,9 +555,12 @@ class TerminalBridge:
                 break
 
         if not found:
-            # Timeout - send Ctrl+C to cancel hung command
-            self.pty.write("\x03")
-            time.sleep(0.5)
+            # Timeout - send Ctrl+C multiple times to ensure recovery
+            for _ in range(3):
+                self.pty.write("\x03")
+                time.sleep(0.5)
+            # Wait briefly for shell prompt to reappear
+            time.sleep(1.0)
             return ["[TIMEOUT]"], -1
 
         # Small delay for screen to stabilize

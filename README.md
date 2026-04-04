@@ -32,7 +32,7 @@ Open a **CMD window** and run:
 py terminal_bridge.py
 ```
 
-You'll see `[Bridge v2.0.0]` in the startup message and a status bar at the top. Manually SSH into your server:
+You'll see `[Bridge v2.1.0]` in the startup message and a status bar at the top. Manually SSH into your server:
 
 ```bash
 ssh user@your-server.com
@@ -57,6 +57,16 @@ py bridge_run.py --clean "tail -50 ~/train.log"
 
 # Custom timeout
 py bridge_run.py --timeout 30 "quick_check"
+
+# Upload & run a local script (avoids quoting issues)
+py bridge_run.py --script local_analysis.py
+py bridge_run.py --script setup.sh --interpreter bash
+
+# Upload a file to remote
+py bridge_run.py --upload local_data.py /tmp/remote_data.py
+
+# Kill a stuck command
+py bridge_run.py --cancel
 
 # Check SSH connection
 py bridge_run.py --last 3
@@ -88,6 +98,15 @@ In **any** Claude Code project, tell Claude:
 Claude Code will use `bridge_run.py` or the IPC files at `~/.terminal-bridge/` to execute remote commands.
 
 ## Architecture
+
+### v2.1.0 Changes
+
+- **`--script` flag**: Upload and execute local script files via base64 encoding. Completely eliminates quoting and escaping issues when running multi-line Python/bash scripts on remote.
+- **`--cancel` flag**: Send Ctrl+C (x3) to kill stuck commands and recover the terminal. No more manual `KEY:CTRL+C` to command.txt.
+- **`--upload` flag**: Upload local files to remote paths via base64 encoding.
+- **Heredoc detection**: Commands containing `<<` are automatically blocked with a helpful error message, preventing the most common cause of bridge deadlocks.
+- **Busy detection**: Before sending a command, `bridge_run.py` checks if the bridge is already executing. If busy, it waits up to 30s or suggests `--cancel`.
+- **Improved timeout recovery**: Bridge now sends Ctrl+C 3 times (instead of 1) on timeout, with a 1s settling delay, ensuring reliable terminal recovery.
 
 ### v2.0.0 Changes
 
@@ -187,13 +206,17 @@ Options:
 py bridge_run.py [OPTIONS] "command"
 
 Options:
-  --raw            Output only command result (skip metadata)
-  --clean          Strip ANSI escapes from output
-  --timeout N      Timeout in seconds (default: 130)
-  --last N         Read last N screen lines (no command sent)
-  --scroll N       Read N scrollback lines
-  --status         Show bridge status as JSON
-  --id ID          Custom request ID (auto-generated if omitted)
+  --raw                 Output only command result (skip metadata)
+  --clean               Strip ANSI escapes from output
+  --timeout N           Timeout in seconds (default: 130)
+  --last N              Read last N screen lines (no command sent)
+  --scroll N            Read N scrollback lines
+  --status              Show bridge status as JSON
+  --id ID               Custom request ID (auto-generated if omitted)
+  --script FILE         Upload & execute a local script file
+  --interpreter NAME    Interpreter for --script (default: python3)
+  --upload LOCAL REMOTE Upload local file to remote path
+  --cancel              Send Ctrl+C to kill stuck command
 ```
 
 ## FAQ
@@ -205,13 +228,19 @@ Yes! IPC files are stored in a fixed global path (`~/.terminal-bridge/`), so any
 Type passwords directly in the Bridge CMD window. Never send passwords through `command.txt`.
 
 **Q: What if another bridge is already running?**
-v2.0.0 has single-instance protection. The new bridge will show an error with the old PID. Close the old bridge window or `taskkill /F /PID <pid>`.
+v2.0.0+ has single-instance protection. The new bridge will show an error with the old PID. Close the old bridge window or `taskkill /F /PID <pid>`.
 
 **Q: What about progress bars / ANSI codes in output?**
 Use `bridge_run.py --clean` or `EXEC:CLEAN:` to automatically strip ANSI escape sequences.
 
 **Q: How do I check running task progress cheaply?**
 Use `bridge_run.py --last 3` -- reads only the last few screen lines without sending any command.
+
+**Q: How do I run multi-line scripts without quoting issues?**
+Use `bridge_run.py --script local_file.py`. The file is base64-encoded, uploaded, and executed. Zero quoting issues.
+
+**Q: The bridge is stuck / not responding?**
+Run `bridge_run.py --cancel` to send Ctrl+C and recover. If that doesn't help, restart the bridge window.
 
 ## Common Pitfalls
 
@@ -221,9 +250,11 @@ Use `bridge_run.py --last 3` -- reads only the last few screen lines without sen
 
 3. **Each Bridge start is a fresh session.** Restarting the Bridge drops the old SSH connection.
 
-4. **Always verify request IDs.** `bridge_run.py` does this automatically. With raw IPC, check `[req_id:]` in result.txt.
+4. **Never use heredoc (`<<`) in commands.** It causes the bridge to deadlock. `bridge_run.py` blocks this automatically. Use `--script` instead.
 
-5. **Use BATCH for multiple queries.** One BATCH command is faster than 3 separate EXECs.
+5. **Always verify request IDs.** `bridge_run.py` does this automatically. With raw IPC, check `[req_id:]` in result.txt.
+
+6. **Use BATCH for multiple queries.** One BATCH command is faster than 3 separate EXECs.
 
 ## Claude Code Skill
 
